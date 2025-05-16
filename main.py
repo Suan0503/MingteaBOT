@@ -85,7 +85,3 @@ def handle_message(event):
 
     if reply:
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-
-# 啟動 Flask 應用
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
