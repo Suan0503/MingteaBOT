@@ -4,10 +4,11 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage, FollowEve
 from linebot.exceptions import InvalidSignatureError
 import os
 import psycopg2
+from datetime import datetime
 
 app = Flask(__name__)
 
-# LINE 機器人設定（從 Railway 環境變數讀取）
+# LINE 機器人設定
 line_bot_api = LineBotApi(os.getenv("LINE_CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("LINE_CHANNEL_SECRET"))
 
@@ -22,27 +23,31 @@ conn_info = {
 
 # 建立資料庫連線
 def get_db_conn():
-    return psycopg2.connect(**conn_info)
+    try:
+        return psycopg2.connect(**conn_info)
+    except Exception as e:
+        print(f"資料庫連線失敗：{e}")
+        return None
 
-# LINE 官方驗證時有時會打 /webhook，也給它個 OK 防錯
-@app.route("/webhook", methods=['POST'])
-def webhook_ping():
-    return 'Webhook working.', 200
-
-# LINE Webhook 進入點
-@app.route("/callback", methods=['POST'])
+# webhook 路徑
+@app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get('X-Line-Signature')
+    signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
+    print("接收到 webhook：", body)
 
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
+        print("簽名驗證失敗")
         abort(400)
+    except Exception as e:
+        print("處理 webhook 錯誤：", e)
+        abort(500)
 
-    return 'OK'
+    return "OK"
 
-# 使用者加入時
+# 使用者加入觸發
 @handler.add(FollowEvent)
 def handle_follow(event):
     line_bot_api.reply_message(
@@ -54,43 +59,45 @@ def handle_follow(event):
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_input = event.message.text.strip()
-
-    if not user_input.startswith("09") or len(user_input) != 10:
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="請輸入正確手機號碼格式（09開頭共10碼）")
-        )
-        return
-
-    conn = get_db_conn()
-    cur = conn.cursor()
-
-    # 查詢該手機是否存在於名單中
-    cur.execute("SELECT status, verified FROM users WHERE phone = %s", (user_input,))
-    row = cur.fetchone()
-
     reply = None
 
-    if row:
-        status, verified = row
-        if verified:
-            reply = "您已經驗證過囉～"
-        elif status == 'white':
-            cur.execute("UPDATE users SET verified = TRUE WHERE phone = %s", (user_input,))
-            reply = "✅ 驗證成功！歡迎您～"
-        elif status == 'black':
-            reply = None  # 黑名單不處理、不回應
+    if not user_input.startswith("09") or len(user_input) != 10:
+        reply = "請輸入正確手機號碼格式（09開頭共10碼）"
     else:
-        # 沒在名單中，自動新增為白名單 + 驗證成功
-        cur.execute("""
-            INSERT INTO users (phone, status, source, created_at, verified)
-            VALUES (%s, 'white', 'auto-line', NOW(), TRUE)
-        """, (user_input,))
-        reply = "✅ 首次驗證成功，已加入白名單～"
+        conn = get_db_conn()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT status, verified FROM users WHERE phone = %s", (user_input,))
+                row = cur.fetchone()
 
-    conn.commit()
-    cur.close()
-    conn.close()
+                if row:
+                    status, verified = row
+                    if verified:
+                        reply = "您已經驗證過囉～"
+                    elif status == 'white':
+                        cur.execute("UPDATE users SET verified = TRUE WHERE phone = %s", (user_input,))
+                        reply = "✅ 驗證成功！歡迎您～"
+                    elif status == 'black':
+                        reply = None  # 黑名單不回應
+                else:
+                    cur.execute("""
+                        INSERT INTO users (phone, status, source, created_at, verified)
+                        VALUES (%s, 'white', 'auto-line', %s, TRUE)
+                    """, (user_input, datetime.now()))
+                    reply = "✅ 首次驗證成功，已加入白名單～"
+
+                conn.commit()
+                cur.close()
+            except Exception as e:
+                print("資料庫處理錯誤：", e)
+            finally:
+                conn.close()
+        else:
+            reply = "🚨 系統忙碌中，請稍後再試"
 
     if reply:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        try:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        except Exception as e:
+            print("LINE 回覆錯誤：", e)
