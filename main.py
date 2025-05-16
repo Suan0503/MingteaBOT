@@ -1,18 +1,15 @@
 from flask import Flask, request, abort
-from linebot.v3.messaging import MessagingApi, Configuration, ApiClient
-from linebot.v3.webhook import WebhookHandler
+from linebot.v3.messaging import MessagingApi, Configuration, ApiClient, ReplyMessageRequest, TextMessage
+from linebot.v3.webhooks import WebhookParser, MessageEvent, FollowEvent, TextMessageContent
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.models import MessageEvent, TextMessageContent, TextMessage, ReplyMessageRequest, FollowEvent
-
-import os
-import psycopg2
-from datetime import datetime
+import os, psycopg2
 
 app = Flask(__name__)
 
-# 初始化 LINE Messaging API
+# LINE 機器人設定
 configuration = Configuration(access_token=os.getenv("LINE_CHANNEL_ACCESS_TOKEN"))
-handler = WebhookHandler(os.getenv("LINE_CHANNEL_SECRET"))
+line_bot_api = MessagingApi(ApiClient(configuration))
+parser = WebhookParser(os.getenv("LINE_CHANNEL_SECRET"))
 
 # PostgreSQL 連線資訊
 conn_info = {
@@ -23,25 +20,32 @@ conn_info = {
     "password": os.getenv("PGPASSWORD")
 }
 
+# 建立資料庫連線
 def get_db_conn():
     return psycopg2.connect(**conn_info)
 
-@app.route("/callback", methods=["POST"])
+# Webhook 路徑
+@app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers["X-Line-Signature"]
+    signature = request.headers.get("x-line-signature")
     body = request.get_data(as_text=True)
 
     try:
-        handler.handle(body, signature)
+        events = parser.parse(body, signature)
     except InvalidSignatureError:
         abort(400)
 
+    for event in events:
+        if isinstance(event, FollowEvent):
+            handle_follow(event)
+        elif isinstance(event, MessageEvent) and isinstance(event.message, TextMessageContent):
+            handle_message(event)
+
     return "OK"
 
-@handler.add(FollowEvent)
-def handle_follow_event(event):
+# 使用者加入時觸發
+def handle_follow(event):
     with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
@@ -49,52 +53,49 @@ def handle_follow_event(event):
             )
         )
 
-@handler.add(MessageEvent)
-def handle_message_event(event):
-    if not isinstance(event.message, TextMessageContent):
-        return
-
+# 接收文字訊息處理邏輯
+def handle_message(event):
     user_input = event.message.text.strip()
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
 
-        if not user_input.startswith("09") or len(user_input) != 10:
+    if not user_input.startswith("09") or len(user_input) != 10:
+        with ApiClient(configuration) as api_client:
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
                     messages=[TextMessage(text="請輸入正確手機號碼格式（09開頭共10碼）")]
                 )
             )
-            return
+        return
 
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT status, verified FROM users WHERE phone = %s", (user_input,))
-        row = cur.fetchone()
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT status, verified FROM users WHERE phone = %s", (user_input,))
+    row = cur.fetchone()
 
-        reply = None
+    reply = None
 
-        if row:
-            status, verified = row
-            if verified:
-                reply = "您已經驗證過囉～"
-            elif status == "white":
-                cur.execute("UPDATE users SET verified = TRUE WHERE phone = %s", (user_input,))
-                reply = "✅ 驗證成功！歡迎您～"
-            elif status == "black":
-                reply = None  # 黑名單不回應
-        else:
-            cur.execute("""
-                INSERT INTO users (phone, status, source, created_at, verified)
-                VALUES (%s, 'white', 'auto-line', %s, TRUE)
-            """, (user_input, datetime.now()))
-            reply = "✅ 首次驗證成功，已加入白名單～"
+    if row:
+        status, verified = row
+        if verified:
+            reply = "您已經驗證過囉～"
+        elif status == 'white':
+            cur.execute("UPDATE users SET verified = TRUE WHERE phone = %s", (user_input,))
+            reply = "✅ 驗證成功！歡迎您～"
+        elif status == 'black':
+            reply = None  # 黑名單不回應
+    else:
+        cur.execute("""
+            INSERT INTO users (phone, status, source, created_at, verified)
+            VALUES (%s, 'white', 'auto-line', NOW(), TRUE)
+        """, (user_input,))
+        reply = "✅ 首次驗證成功，已加入白名單～"
 
-        conn.commit()
-        cur.close()
-        conn.close()
+    conn.commit()
+    cur.close()
+    conn.close()
 
-        if reply:
+    if reply:
+        with ApiClient(configuration) as api_client:
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
