@@ -2,4 +2,3 @@ flask
 line-bot-sdk==3.4.0
 psycopg2-binary
 gunicorn
-aiohttp==3.8.5
