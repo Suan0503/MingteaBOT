@@ -1,2 +1,5 @@
 pandas
 psycopg2-binary
+flask
+line-bot-sdk
+psycopg2-binary
